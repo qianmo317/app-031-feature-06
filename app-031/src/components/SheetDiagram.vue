@@ -57,9 +57,12 @@ const stepsShown = computed(() => {
 })
 
 const trim = computed(() => {
+  // 修边区按这张板自己实际使用的四周修边画；兼容旧结果（无字段时从修边刀位置反推）
+  if (typeof props.sheet.trimMm === 'number' && props.sheet.trimMm >= 0) {
+    return Math.round(props.sheet.trimMm * 10) / 10
+  }
   const st0 = props.sheet.steps.find((s) => s.kind === 'trim')
-  if (!st0) return 8
-  return Math.round(st0.at)
+  return st0 ? st0.at + (props.sheet.kerfMm ?? 0) / 2 : 8
 })
 
 // 拖拽

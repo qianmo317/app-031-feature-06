@@ -7,10 +7,12 @@ import {
   saveJob,
   runNest,
   newPart,
-  allStockTemplates
+  allStockTemplates,
+  updateCutParams
 } from '../lib/store'
 import { uid, parsePartText, parseEdges, money } from '../lib/format'
 import { toast } from '../lib/ui'
+import { effectiveBoardParams, jobParams, paramsTooDifferent, type BoardParams } from '../lib/params'
 import type { Board, EdgeSide, Part } from '../types'
 
 const route = useRoute()
@@ -45,6 +47,34 @@ const availableOffcuts = computed(() => state.offcuts.filter((o) => o.available)
 
 function save(): void {
   if (job.value) saveJob(job.value)
+}
+
+// 每种板实际生效的锯路/修边（没填跟整单），仅用于页面展示与超板幅检查
+function effParams(b: Board): BoardParams {
+  return job.value ? effectiveBoardParams(b, job.value) : { kerf: 0, trim: 0 }
+}
+function followsJob(b: Board, which: 'kerf' | 'trim'): boolean {
+  // 直接看这一项有没有留空：留空才跟随整单（自填值恰好等于整单不算跟随）
+  return which === 'kerf' ? b.kerfMm === undefined : b.trimMm === undefined
+}
+
+/** 整单/逐板参数输入：留空回到「跟随整单」；改完若已排样立即重算。 */
+function onParamInput(board: Board | undefined, which: 'kerf' | 'trim', e: Event): void {
+  if (!job.value) return
+  const el = e.target as HTMLInputElement
+  const raw = el.value.trim()
+  if (raw === '') {
+    updateCutParams({ job: job.value, boardId: board?.id, [which]: null })
+    return
+  }
+  const v = Number(raw)
+  if (!Number.isFinite(v)) return
+  updateCutParams({
+    job: job.value,
+    boardId: board?.id,
+    [which]: which === 'trim' ? Math.max(0, Math.min(20, v)) : Math.max(0.1, Math.min(8, v))
+  })
+  toast(job.value.result ? '参数已更新，排样/刀路/统计已按新值重算' : '参数已保存', 'good', 1600)
 }
 
 function addBoard(): void {
@@ -117,20 +147,49 @@ const warnings = computed<string[]>(() => {
   const out: string[] = []
   const j = job.value
   if (!j) return out
-  const maxW = Math.max(...j.boards.map((b) => b.wMm - 2 * j.trimMm))
-  const maxH = Math.max(...j.boards.map((b) => b.hMm - 2 * j.trimMm))
-  for (const p of j.parts) {
-    const long = Math.max(p.lenMm, p.widMm)
-    const short = Math.min(p.lenMm, p.widMm)
+  const jp = jobParams(j)
+  // 检查一个零件在指定板种（或所有自动候选板）上是否超板幅；一律用该板自己的修边
+  const checkFit = (p: Part, labelW: number, labelH: number, maxW: number, maxH: number): void => {
     if (p.grain === 'length' && (p.lenMm > maxW || p.widMm > maxH))
-      out.push(`「${p.code}」竖纹件 ${p.lenMm}×${p.widMm} 超过可用板幅 ${maxW}×${maxH}`)
+      out.push(`「${p.code}」竖纹件 ${p.lenMm}×${p.widMm} 超过可用板幅 ${labelW}×${labelH}`)
     if (p.grain === 'width' && (p.widMm > maxW || p.lenMm > maxH))
-      out.push(`「${p.code}」横纹件 ${p.lenMm}×${p.widMm} 超过可用板幅 ${maxW}×${maxH}`)
-    if (p.grain === 'none' && long > maxW)
-      out.push(`「${p.code}」长边 ${long} 超过板长 ${maxW}`)
-    void short
+      out.push(`「${p.code}」横纹件 ${p.lenMm}×${p.widMm} 超过可用板幅 ${labelW}×${labelH}`)
+    if (p.grain === 'none' && Math.max(p.lenMm, p.widMm) > maxW)
+      out.push(`「${p.code}」长边超过板长 ${labelW}`)
   }
-  if (j.trimMm < 5 || j.trimMm > 10) out.push('修边量通常取 5~10mm')
+  for (const p of j.parts) {
+    if (p.boardId) {
+      const b = j.boards.find((x) => x.id === p.boardId)
+      if (b) {
+        const pa = effParams(b)
+        checkFit(p, b.wMm - 2 * pa.trim, b.hMm - 2 * pa.trim, b.wMm - 2 * pa.trim, b.hMm - 2 * pa.trim)
+      }
+    } else {
+      // 自动件：按所有候选板里最大的可用幅面（各自的修边）检查
+      const maxW = Math.max(...j.boards.map((b) => b.wMm - 2 * effParams(b).trim))
+      const maxH = Math.max(...j.boards.map((b) => b.hMm - 2 * effParams(b).trim))
+      checkFit(p, maxW, maxH, maxW, maxH)
+    }
+  }
+  if (jp.trim < 5 || jp.trim > 10) out.push('整单修边量通常取 5~10mm（逐板另填的不受此限）')
+  // 勾选的余料板：厚度相同但锯路/修边差太多的板种，不能跟余料板拼同一张
+  for (const oc of availableOffcuts.value) {
+    if (!j.useOffcutIds.includes(oc.id)) continue
+    const ocParams = jp // 余料板自身不设逐板值，沿用整单
+    for (const b of j.boards) {
+      if (b.thicknessMm !== oc.thicknessMm) continue
+      const bp = effParams(b)
+      if (paramsTooDifferent(bp, ocParams)) {
+        out.push(
+          `「${b.name}」锯路 ${bp.kerf.toFixed(1)}mm/修边 ${bp.trim.toFixed(
+            1
+          )}mm 与勾选余料板（锯路 ${ocParams.kerf.toFixed(1)}mm/修边 ${ocParams.trim.toFixed(
+            1
+          )}mm）差太多，两种件不会拼同一张板，将分别开板`
+        )
+      }
+    }
+  }
   return out
 })
 
@@ -205,18 +264,29 @@ const sampleTsv = `名称\t长\t宽\t数量\t纹理\t封边\t柜体\t见光
     <!-- 参数与余料 -->
     <section class="panel" style="margin-bottom: 14px">
       <div class="row wrap" style="align-items: flex-end">
-        <label class="field" style="width: 130px">
-          <span>锯路 kerf (mm)</span>
-          <input v-model.number="job.kerfMm" type="number" step="0.1" min="1" max="8" @change="save" />
+        <label class="field" style="width: 150px">
+          <span>整单锯路 kerf (mm)</span>
+          <input
+            :value="job.kerfMm.toFixed(1)"
+            type="number" step="0.1" min="0.1" max="8"
+            @change="onParamInput(undefined, 'kerf', $event)"
+          />
         </label>
-        <label class="field" style="width: 130px">
-          <span>四周修边 (mm)</span>
-          <input v-model.number="job.trimMm" type="number" step="1" min="0" max="20" @change="save" />
+        <label class="field" style="width: 150px">
+          <span>整单四周修边 (mm)</span>
+          <input
+            :value="job.trimMm.toFixed(1)"
+            type="number" step="0.1" min="0" max="20"
+            @change="onParamInput(undefined, 'trim', $event)"
+          />
         </label>
         <label class="field row" style="margin-bottom: 10px">
           <input type="checkbox" v-model="job.batchByCabinet" @change="save" />
           <span style="margin: 0 0 0 6px">按柜体批次分组开料（同柜零件尽量连续排）</span>
         </label>
+        <span class="small muted" style="margin-bottom: 10px">
+          板材行里可按板单独填锯路/修边；留空即跟整单，改整单值只带动留空的板（数值 mm，保留 1 位小数）。
+        </span>
       </div>
       <div v-if="availableOffcuts.length > 0">
         <h4 style="margin: 8px 0 6px; font-size: 13px">余料优先：勾选已登记余料作为小板材参与本单排样</h4>
@@ -249,6 +319,7 @@ const sampleTsv = `名称\t长\t宽\t数量\t纹理\t封边\t柜体\t见光
         <thead>
           <tr>
             <th>名称/材质</th><th>长(mm)</th><th>宽(mm)</th><th>厚(mm)</th>
+            <th>锯路(mm)</th><th>修边(mm)</th>
             <th>单价</th><th>库存张数(0=不限)</th><th></th>
           </tr>
         </thead>
@@ -261,6 +332,26 @@ const sampleTsv = `名称\t长\t宽\t数量\t纹理\t封边\t柜体\t见光
             <td style="width: 96px"><input v-model.number="b.wMm" type="number" @change="save" /></td>
             <td style="width: 96px"><input v-model.number="b.hMm" type="number" @change="save" /></td>
             <td style="width: 84px"><input v-model.number="b.thicknessMm" type="number" @change="save" /></td>
+            <td style="width: 92px">
+              <input
+                class="param-input"
+                :class="{ following: followsJob(b, 'kerf') }"
+                :value="b.kerfMm === undefined ? '' : b.kerfMm.toFixed(1)"
+                type="number" step="0.1" min="0.1" max="8" placeholder="跟整单"
+                :title="`留空跟随整单 ${job.kerfMm.toFixed(1)}mm；本行实际生效 ${effParams(b).kerf.toFixed(1)}mm`"
+                @change="onParamInput(b, 'kerf', $event)"
+              />
+            </td>
+            <td style="width: 92px">
+              <input
+                class="param-input"
+                :class="{ following: followsJob(b, 'trim') }"
+                :value="b.trimMm === undefined ? '' : b.trimMm.toFixed(1)"
+                type="number" step="0.1" min="0" max="20" placeholder="跟整单"
+                :title="`留空跟随整单 ${job.trimMm.toFixed(1)}mm；本行实际生效 ${effParams(b).trim.toFixed(1)}mm`"
+                @change="onParamInput(b, 'trim', $event)"
+              />
+            </td>
             <td style="width: 110px"><input v-model.number="b.priceCents" type="number" @change="save" /></td>
             <td style="width: 130px"><input v-model.number="b.quantity" type="number" min="0" @change="save" /></td>
             <td style="width: 46px"><button class="sm ghost-danger" @click="removeBoard(b.id)">删</button></td>
@@ -386,6 +477,11 @@ const sampleTsv = `名称\t长\t宽\t数量\t纹理\t封边\t柜体\t见光
   margin-top: 3px;
   font-size: 11px;
   color: var(--c-ink-2);
+}
+.param-input.following {
+  color: var(--c-ink-2);
+  font-style: italic;
+  background: #f7f9f6;
 }
 .import-box {
   border: 1px dashed var(--c-line);

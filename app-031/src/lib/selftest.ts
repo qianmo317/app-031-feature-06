@@ -5,6 +5,7 @@ import type { Board, Job, Part } from '../types'
 import { nestJob } from './packing'
 import { simulate, countSawOps } from './cuts'
 import { guillotineViolation, type Rect } from './geometry'
+import { effectiveBoardParams, jobParams } from './params'
 
 export interface CheckResult {
   name: string
@@ -78,11 +79,11 @@ function makeJob(parts: Part[], over: Partial<Job> = {}): Job {
   }
 }
 
-/** 检查同板任意两件之间的净距：只要相邻就必须 ≥ kerf；四周 ≥ trim。 */
+/** 检查同板任意两件之间的净距：只要相邻就必须 ≥ 该张板自己的锯路；四周 ≥ 该张修边。 */
 function assertClearances(job: Job): string | null {
-  const kerf = job.kerfMm
-  const trim = job.trimMm
   for (const sheet of job.result!.sheets) {
+    const kerf = sheet.kerfMm
+    const trim = sheet.trimMm
     const ps = sheet.placements
     for (const p of ps) {
       if (p.x < trim - 0.06 || p.y < trim - 0.06) return '零件越过修边区（左下）'
@@ -96,7 +97,7 @@ function assertClearances(job: Job): string | null {
         const ox = Math.min(a.x + a.lenMm, b.x + b.lenMm) - Math.max(a.x, b.x)
         const oy = Math.min(a.y + a.widMm, b.y + b.widMm) - Math.max(a.y, b.y)
         if (ox > 0.06 && oy > 0.06) return '零件重叠'
-        // 同向投影有重叠时，另一轴的净距必须 ≥ kerf
+        // 同向投影有重叠时，另一轴的净距必须 ≥ 该张板锯路
         if (ox > 0.06) {
           const gap = Math.abs(a.y + a.widMm - b.y) < Math.abs(a.y - (b.y + b.widMm))
             ? b.y - (a.y + a.widMm)
@@ -140,7 +141,7 @@ function dumpJob(job: Job, err?: string): void {
         console.error('DUMP_PL', p.code, p.x, p.y, p.lenMm, p.widMm, p.grain)
       for (const st of sheet.steps)
         console.error('DUMP_ST', st.order, st.kind, st.axis, st.at, st.span[0], st.span[1])
-      const sim = simulate(sheet.wMm, sheet.hMm, job.kerfMm, sheet.steps, sheet.placements)
+      const sim = simulate(sheet.wMm, sheet.hMm, sheet.kerfMm, sheet.steps, sheet.placements)
       console.error('DUMP_SIM', JSON.stringify(sim.errors))
       for (const lf of sim.leaves)
         console.error('DUMP_LEAF', Math.round(lf.x), Math.round(lf.y), Math.round(lf.w), Math.round(lf.h))
@@ -160,15 +161,15 @@ function assertSheet(job: Job): string | null {
       h: p.widMm
     }))
     const bounds: Rect = {
-      x: job.trimMm,
-      y: job.trimMm,
-      w: sheet.wMm - 2 * job.trimMm,
-      h: sheet.hMm - 2 * job.trimMm
+      x: sheet.trimMm,
+      y: sheet.trimMm,
+      w: sheet.wMm - 2 * sheet.trimMm,
+      h: sheet.hMm - 2 * sheet.trimMm
     }
-    const v = guillotineViolation(rects, bounds, job.kerfMm)
+    const v = guillotineViolation(rects, bounds, sheet.kerfMm)
     if (v) return `板${sheet.index + 1}：${v}`
-    // 逐步切割模拟
-    const sim = simulate(sheet.wMm, sheet.hMm, job.kerfMm, sheet.steps, sheet.placements)
+    // 逐步切割模拟（逐板参数）
+    const sim = simulate(sheet.wMm, sheet.hMm, sheet.kerfMm, sheet.steps, sheet.placements)
     if (!sim.ok) return `板${sheet.index + 1}：${sim.errors.join('；')}`
     // 利用率复算（分子不含锯路）
     const net = sheet.placements.reduce((a, p) => a + p.origLen * p.origWid, 0)
@@ -331,7 +332,7 @@ export function runSelfTest(): SelfTestReport {
     const r = nestJob(job)
     const ops = countSawOps(r.sheets)
     const simsOk = r.sheets.every((s) =>
-      simulate(s.wMm, s.hMm, job.kerfMm, s.steps, s.placements).ok
+      simulate(s.wMm, s.hMm, s.kerfMm, s.steps, s.placements).ok
     )
     const placed = r.sheets.reduce((a, s) => a + s.placements.length, 0)
     const ok = ops <= 20 && simsOk && placed === 30 && r.sheets.length === 2
@@ -438,6 +439,183 @@ export function runSelfTest(): SelfTestReport {
       '多板种混排且 18mm 库存仅 1 张时超开并提示补采',
       ok,
       `18mm 用 ${thickSheets} 张（库存 1，需补采）、9mm 用 ${thinSheets} 张`
+    )
+  }
+
+  // 10) 逐板锯路/修边：每种板在自己的板上用自己的取值，刀路/模拟一致
+  {
+    const bThick = makeBoard({ id: 'p10-thick', name: '18 板', thicknessMm: 18 })
+    const bThin = makeBoard({
+      id: 'p10-thin',
+      name: '9 背板',
+      wMm: 2440,
+      hMm: 1220,
+      thicknessMm: 9
+    })
+    bThin.kerfMm = 2.0
+    bThin.trimMm = 4.0
+    const parts = [
+      makePart({ code: 'K1', lenMm: 800, widMm: 500, qty: 2, boardId: 'p10-thick' }),
+      makePart({ code: 'K2', lenMm: 800, widMm: 500, qty: 2, boardId: 'p10-thin' })
+    ]
+    const job = makeJob(parts, { boards: [bThick, bThin], kerfMm: 3.2, trimMm: 8 })
+    const r = nestJob(job)
+    const thickSheet = r.sheets.find((s) => s.boardId === 'p10-thick')!
+    const thinSheet = r.sheets.find((s) => s.boardId === 'p10-thin')!
+    const okVals =
+      thickSheet.kerfMm === 3.2 &&
+      thickSheet.trimMm === 8 &&
+      thinSheet.kerfMm === 2.0 &&
+      thinSheet.trimMm === 4.0
+    const trimAt = thinSheet.steps.find((s) => s.kind === 'trim')
+    const okTrimAt = !!trimAt && Math.abs(trimAt.at - (4 - 2 / 2)) < 0.06 // trim - kerf/2 = 3.0
+    const simsOk = r.sheets.every((s) =>
+      simulate(s.wMm, s.hMm, s.kerfMm, s.steps, s.placements).ok
+    )
+    add(
+      '逐板锯路/修边：厚板用整单 3.2/8、薄板用自填 2.0/4，修边刀位置跟随各板',
+      okVals && okTrimAt && simsOk,
+      `厚板 ${thickSheet.kerfMm}/${thickSheet.trimMm}，薄板 ${thinSheet.kerfMm}/${thinSheet.trimMm}，薄板首修边刀位 ${trimAt?.at}（期望 3.0），模拟 ${simsOk ? '通过' : '失败'}`
+    )
+  }
+
+  // 11) 解析规则：没填的板跟整单；改整单值只带动跟的板，填过的不动
+  {
+    const follower: Board = makeBoard({ id: 'p11-f' })
+    const overridden: Board = makeBoard({ id: 'p11-o' })
+    overridden.kerfMm = 5.0
+    overridden.trimMm = 6.0
+    const job = makeJob([makePart({})], { boards: [follower, overridden], kerfMm: 3.2, trimMm: 8 })
+    const before = {
+      f: effectiveBoardParams(follower, job),
+      o: effectiveBoardParams(overridden, job)
+    }
+    job.kerfMm = 4.0
+    job.trimMm = 9.0
+    const after = {
+      f: effectiveBoardParams(follower, job),
+      o: effectiveBoardParams(overridden, job)
+    }
+    const ok =
+      before.f.kerf === 3.2 &&
+      before.f.trim === 8 &&
+      before.o.kerf === 5 &&
+      before.o.trim === 6 &&
+      after.f.kerf === 4 &&
+      after.f.trim === 9 &&
+      after.o.kerf === 5 &&
+      after.o.trim === 6
+    add(
+      '逐板值留空跟随整单、改整单只带动跟随者（自填值不被带动）',
+      ok,
+      `跟随板 ${before.f.kerf}/${before.f.trim} → ${after.f.kerf}/${after.f.trim}；自填板恒为 ${after.o.kerf}/${after.o.trim}`
+    )
+  }
+
+  // 12) 取值差太多 + 厚度匹配的余料板：不许混拼同一板，必须给明确冲突提示并分别开板
+  {
+    const offcut: Board = {
+      id: 'offcut_wide',
+      name: '余料板 1200×1000×18',
+      wMm: 1200,
+      hMm: 1000,
+      thicknessMm: 18,
+      material: '颗粒板',
+      priceCents: 0,
+      quantity: 1,
+      kind: 'offcut'
+    }
+    const stock: Board = makeBoard({ id: 'p12-stock', name: '18 大板', thicknessMm: 18 })
+    stock.kerfMm = 5.0
+    stock.trimMm = 8.0
+    const parts = [
+      // 自动件先把余料板按整单 3.2/8 打开
+      makePart({ code: 'AUTO', lenMm: 500, widMm: 500, boardId: '' }),
+      // 指定板件锯路 5.0，与余料板 3.2 差 1.8mm（>1mm 容差），不得拼上余料板
+      makePart({ code: 'WIDE', lenMm: 500, widMm: 500, boardId: 'p12-stock' })
+    ]
+    const job = makeJob(parts, { boards: [offcut, stock], kerfMm: 3.2, trimMm: 8 })
+    const r = nestJob(job)
+    const offcutSheet = r.sheets.find((s) => s.boardId === 'offcut_wide')!
+    const stockSheet = r.sheets.find((s) => s.boardId === 'p12-stock')!
+    const notMixed =
+      offcutSheet.placements.every((p) => p.code === 'AUTO') &&
+      stockSheet.placements.some((p) => p.code === 'WIDE')
+    const conflict = r.paramConflicts.find(
+      (c) => c.boardA === stock.name && c.boardB === offcut.name
+    )
+    const simsOk = r.sheets.every((s) =>
+      simulate(s.wMm, s.hMm, s.kerfMm, s.steps, s.placements).ok
+    )
+    add(
+      '锯路差 1.8mm（>1mm）时不与余料板混拼：分别开板且有明确冲突提示',
+      notMixed && !!conflict && simsOk,
+      conflict
+        ? `已提示：${conflict.message.slice(0, 48)}…；余料板件 ${offcutSheet.placements
+            .map((p) => p.code)
+            .join('/')}，大板件 ${stockSheet.placements.map((p) => p.code).join('/')}`
+        : '未产生冲突提示'
+    )
+  }
+
+  // 13) 取值差在容差内的同厚度余料板：允许拼到同一板（不产生冲突）
+  {
+    const offcut: Board = {
+      id: 'offcut_close',
+      name: '余料板 1200×1000×18',
+      wMm: 1200,
+      hMm: 1000,
+      thicknessMm: 18,
+      material: '颗粒板',
+      priceCents: 0,
+      quantity: 1,
+      kind: 'offcut'
+    }
+    const stock: Board = makeBoard({ id: 'p13-stock', name: '18 大板 B', thicknessMm: 18 })
+    stock.kerfMm = 3.8
+    stock.trimMm = 9.0 // 锯路差 0.6 ≤1、修边差 1 ≤3
+    const parts = [
+      makePart({ code: 'AUTO2', lenMm: 400, widMm: 400, boardId: '' }),
+      makePart({ code: 'CLOSE', lenMm: 400, widMm: 400, boardId: 'p13-stock' })
+    ]
+    const job = makeJob(parts, { boards: [offcut, stock], kerfMm: 3.2, trimMm: 8 })
+    const r = nestJob(job)
+    const offcutSheet = r.sheets.find((s) => s.boardId === 'offcut_close')!
+    const mixed = offcutSheet.placements.some((p) => p.code === 'AUTO2')
+    const noConflict = r.paramConflicts.length === 0
+    const simsOk = r.sheets.every((s) =>
+      simulate(s.wMm, s.hMm, s.kerfMm, s.steps, s.placements).ok
+    )
+    add(
+      '锯路差 0.6/修边差 1（容差内）允许同板拼排且不报冲突、模拟仍正确',
+      mixed && noConflict && simsOk,
+      `余料板件 ${offcutSheet.placements.map((p) => p.code).join('/')}，冲突 ${r.paramConflicts.length} 条`
+    )
+  }
+
+  // 14) 旧版本项目：没有逐板字段、旧结果没有逐张字段时也能打开并按整单一套用
+  {
+    const legacy = makeJob([makePart({ code: 'OLD', lenMm: 600, widMm: 400, qty: 2 })], {
+      kerfMm: 3.2,
+      trimMm: 8
+    })
+    delete (legacy.boards[0] as Partial<Board>).kerfMm
+    delete (legacy.boards[0] as Partial<Board>).trimMm
+    const r = nestJob(legacy)
+    legacy.result = JSON.parse(JSON.stringify(r)) as typeof r
+    // 模拟旧数据：剥掉逐张字段
+    for (const s of legacy.result.sheets) {
+      delete (s as Partial<typeof s>).kerfMm
+      delete (s as Partial<typeof s>).trimMm
+    }
+    delete (legacy.result as Partial<typeof legacy.result>).paramConflicts
+    const jp = jobParams(legacy)
+    const ep = effectiveBoardParams(legacy.boards[0], legacy)
+    const ok = ep.kerf === 3.2 && ep.trim === 8 && jp.kerf === 3.2
+    add(
+      '旧项目无逐板/逐张字段时不报错，按整单 3.2/8 接着用',
+      ok,
+      `板生效 ${ep.kerf}/${ep.trim}（缺字段读取不崩），结果 ${legacy.result.sheets.length} 张可继续查看`
     )
   }
 

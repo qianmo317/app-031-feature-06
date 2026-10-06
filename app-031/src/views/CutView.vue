@@ -77,9 +77,10 @@ function printCut(): void {
 <template>
   <div v-if="job && result && sheet">
     <section class="panel ctrl-bar">
-      <select v-model.number="activeSheet" style="width: 220px">
+      <select v-model.number="activeSheet" style="width: 320px">
         <option v-for="s in result.sheets" :key="s.index" :value="s.index">
-          第 {{ s.index + 1 }} 张 · {{ s.boardName }}（{{ s.steps.length }} 刀）
+          第 {{ s.index + 1 }} 张 · {{ s.boardName }}（{{ s.steps.length }} 刀
+          ，锯路 {{ s.kerfMm.toFixed(1) }}/修边 {{ s.trimMm.toFixed(1) }}mm）
         </option>
       </select>
       <button class="sm" @click="reset">⏮ 复位</button>

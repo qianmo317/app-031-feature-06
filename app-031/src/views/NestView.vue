@@ -161,6 +161,9 @@ function printNest(): void {
         {{ u.code }}（{{ u.name }}）×{{ u.qty }}：{{ u.reason }}
       </span>
     </div>
+    <div v-for="(c, i) in result.paramConflicts" :key="'pc' + i" class="alert warn">
+      <b>⚠️ 锯路/修边参数冲突，未强行混算：</b>{{ c.message }}
+    </div>
     <div v-for="sh in result.stockShortage" :key="sh.boardId" class="alert warn">
       库存不足：{{ sh.boardName }} 需要 {{ sh.need }} 张，库存仅 {{ sh.have }} 张，请补采 {{ sh.need - sh.have }} 张。
     </div>
@@ -187,6 +190,8 @@ function printNest(): void {
           <b>第 {{ activeSheet + 1 }} 张 / 共 {{ result.sheets.length }} 张</b>
           <span class="tag">{{ sheet?.boardName }}</span>
           <span class="tag good">利用率 {{ pct(sheet?.utilization ?? 0) }}</span>
+          <span class="tag">锯路 {{ (sheet?.kerfMm ?? 0).toFixed(1) }}mm</span>
+          <span class="tag">修边 {{ (sheet?.trimMm ?? 0).toFixed(1) }}mm</span>
           <span v-if="sheet?.adjusted" class="tag warn">已手工微调</span>
           <div class="spacer" />
           <label class="row small" style="gap:4px">

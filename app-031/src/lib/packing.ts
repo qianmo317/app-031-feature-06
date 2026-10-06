@@ -7,6 +7,7 @@ import type {
   Job,
   NestResult,
   OffcutInfo,
+  ParamConflict,
   Part,
   Placement,
   SheetResult,
@@ -15,6 +16,15 @@ import type {
 import { EPS, type Rect } from './geometry'
 import { buildSteps, simulate } from './cuts'
 import type { DSeg } from './cuts'
+import {
+  effectiveBoardParams,
+  jobParams,
+  mm1,
+  paramsTooDifferent,
+  KERF_DIFF_LIMIT_MM,
+  TRIM_DIFF_LIMIT_MM,
+  type BoardParams
+} from './params'
 
 interface Inst {
   part: Part
@@ -49,8 +59,10 @@ interface SheetState {
   free: FRect[]
   recs: Rec[]
   placements: Placement[]
+  params: BoardParams // 本张锁定的锯路/修边（打开时确定，板内所有件共用）
 }
 
+/** 新开板时能否接收该零件（常规板认 id；余料板认厚度）。 */
 function boardMatches(b: Board, p: Part): boolean {
   if (!p.boardId) return true
   if (b.id === p.boardId) return true
@@ -62,6 +74,8 @@ function boardMatches(b: Board, p: Part): boolean {
 }
 
 const boardDefs = new Map<string, Board>()
+/** 每种板排样时实际生效的参数（逐板值优先，没填跟整单）。 */
+const boardParamsCache = new Map<string, BoardParams>()
 
 /** 统一为横向板（长边沿 x）。余料上台可以转，所以归一化安全。 */
 function normalize(b: Board): Board {
@@ -72,10 +86,45 @@ function normalize(b: Board): Board {
 export function nestJob(job: Job): NestResult {
   const t0 = performance.now()
   boardDefs.clear()
+  boardParamsCache.clear()
   const boards = job.boards.map(normalize)
-  boards.forEach((b) => boardDefs.set(b.id, b))
-  const kerf = job.kerfMm
-  const trim = job.trimMm
+  boards.forEach((b) => {
+    boardDefs.set(b.id, b)
+    boardParamsCache.set(b.id, effectiveBoardParams(b, job))
+  })
+  const fallbackParams = jobParams(job)
+  const paramsOf = (b: Board): BoardParams => boardParamsCache.get(b.id) ?? fallbackParams
+
+  // 两种板取值差太多（锯路差 >1mm 或修边差 >3mm）时不许悄悄拼同一板：
+  // 仅在「同为厚度匹配的余料板」场景下可能发生混拼，这里收集明确提示。
+  const conflicts: ParamConflict[] = []
+  const conflictKeys = new Set<string>()
+  const conflictPartIds = new Set<string>()
+  const noteConflict = (offcut: Board, target: Board, a: BoardParams, b: BoardParams, part: Part): void => {
+    const key = `${offcut.id}|${target.id}|${part.id}`
+    if (conflictKeys.has(key)) return
+    conflictKeys.add(key)
+    conflictPartIds.add(part.id)
+    if (!conflicts.some((c) => c.boardA === target.name && c.boardB === offcut.name)) {
+      conflicts.push({
+        boardA: target.name,
+        boardB: offcut.name,
+        offcutName: offcut.name,
+        kerfA: a.kerf,
+        kerfB: b.kerf,
+        trimA: a.trim,
+        trimB: b.trim,
+        message:
+          `「${target.name}」的锯路 ${a.kerf.toFixed(1)}mm/修边 ${a.trim.toFixed(
+            1
+          )}mm 与余料板「${offcut.name}」沿用的锯路 ${b.kerf.toFixed(1)}mm/修边 ${b.trim.toFixed(
+            1
+          )}mm 差太多（容差 锯路≤${KERF_DIFF_LIMIT_MM.toFixed(1)}mm、修边≤${TRIM_DIFF_LIMIT_MM.toFixed(
+            1
+          )}mm），两类件不能拼到同一张板，已分别开板，未按任一套值强行混算。`
+      })
+    }
+  }
 
   // 各板种实际开板数（用于库存补采提示）
   const openedCount = new Map<string, number>()
@@ -98,12 +147,12 @@ export function nestJob(job: Job): NestResult {
 
   const sheets: SheetState[] = []
   let frSeq = 0
-  const openSheet = (b: Board): SheetState => {
+  const openSheet = (b: Board, params: BoardParams): SheetState => {
     const usable: Rect = {
-      x: trim,
-      y: trim,
-      w: Math.max(1, b.wMm - 2 * trim),
-      h: Math.max(1, b.hMm - 2 * trim)
+      x: params.trim,
+      y: params.trim,
+      w: Math.max(1, b.wMm - 2 * params.trim),
+      h: Math.max(1, b.hMm - 2 * params.trim)
     }
     const s: SheetState = {
       board: b,
@@ -121,7 +170,8 @@ export function nestJob(job: Job): NestResult {
         }
       ],
       recs: [],
-      placements: []
+      placements: [],
+      params
     }
     sheets.push(s)
     return s
@@ -136,13 +186,13 @@ export function nestJob(job: Job): NestResult {
     return true
   }
 
-  const pickNewBoard = (p: Part, pw: number, ph: number): Board | null => {
+  const pickNewBoard = (p: Part, pw: number, ph: number, params: BoardParams): Board | null => {
     const viable = boards.filter(
       (b) =>
         canOpen(b) &&
         boardMatches(b, p) &&
-        fitsClean(b.wMm - 2 * trim, pw) &&
-        fitsClean(b.hMm - 2 * trim, ph)
+        fitsClean(b.wMm - 2 * params.trim, pw, params.kerf) &&
+        fitsClean(b.hMm - 2 * params.trim, ph, params.kerf)
     )
     // 余料小板优先，其次选面积最小的（省大板）
     viable.sort((a, b) => {
@@ -158,7 +208,7 @@ export function nestJob(job: Job): NestResult {
     rotated: boolean
   }
   // 只允许严丝合缝（0）或余隙 ≥ 锯路；0<余隙<锯路 时下不了刀，禁止放入
-  const fitsClean = (avail: number, size: number): boolean => {
+  const fitsClean = (avail: number, size: number, kerf: number): boolean => {
     const gap = avail - size
     return gap >= -EPS && (gap <= EPS || gap >= kerf - EPS)
   }
@@ -182,29 +232,60 @@ export function nestJob(job: Job): NestResult {
   let seq = 0
   for (const inst of sorted) {
     const p = inst.part
+    // 零件的归属板种：指定了就锁定那一种板的参数；自动件先按整单缺省参数找位
+    const assigned = p.boardId ? boardDefs.get(p.boardId) : undefined
+    const assignedParams = assigned ? paramsOf(assigned) : fallbackParams
     let best:
-      | { sheet: SheetState | null; fr: FRect | null; nb: Board | null; o: Orient; tier: number; waste: number }
+      | {
+          sheet: SheetState | null
+          fr: FRect | null
+          nb: Board | null
+          nbParams: BoardParams
+          o: Orient
+          tier: number
+          waste: number
+        }
       | null = null
     for (const o of orientsOf(p)) {
-      // tier 0：已打开的、板种匹配的板里最贴合的空档
+      // tier 0：已打开的板里最贴合的空档。
+      // 同一张板必须用同一套锯路/修边：常规板只认同 id；余料板额外要求
+      // 厚度相同且两套取值差不超过容差，差太多直接拒配并登记冲突提示。
       for (const s of sheets) {
-        if (!boardMatches(s.board, p)) continue
+        const b = s.board
+        let accepted: boolean
+        if (b.kind === 'offcut') {
+          accepted = !p.boardId || (assigned?.thicknessMm === b.thicknessMm)
+          if (accepted && assigned) {
+            const divergent = paramsTooDifferent(assignedParams, s.params)
+            if (divergent) {
+              accepted = false
+              noteConflict(b, assigned, assignedParams, s.params, p)
+            }
+          }
+        } else {
+          accepted = !assigned || b.id === assigned.id
+        }
+        if (!accepted) continue
         for (const fr of s.free) {
-          if (fitsClean(fr.w, o.pw) && fitsClean(fr.h, o.ph)) {
+          if (
+            fitsClean(fr.w, o.pw, s.params.kerf) &&
+            fitsClean(fr.h, o.ph, s.params.kerf)
+          ) {
             const waste = fr.w * fr.h - o.pw * o.ph
             if (!best || waste < best.waste) {
-              best = { sheet: s, fr, nb: null, o, tier: 0, waste }
+              best = { sheet: s, fr, nb: null, nbParams: s.params, o, tier: 0, waste }
             }
           }
         }
       }
-      // tier 1：新开余料小板 / tier 2：新开常规板
-      const nb = pickNewBoard(p, o.pw, o.ph)
+      // tier 1：新开余料小板 / tier 2：新开常规板（候选按零件自己板种的参数估尺寸）
+      const nb = pickNewBoard(p, o.pw, o.ph, assignedParams)
       if (nb) {
         const tier = nb.kind === 'offcut' ? 1 : 2
-        const waste = (nb.wMm - 2 * trim) * (nb.hMm - 2 * trim) - o.pw * o.ph
+        const nbParams = paramsOf(nb)
+        const waste = (nb.wMm - 2 * nbParams.trim) * (nb.hMm - 2 * nbParams.trim) - o.pw * o.ph
         if (!best || tier < best.tier || (tier === best.tier && waste < best.waste)) {
-          best = { sheet: null, fr: null, nb, o, tier, waste }
+          best = { sheet: null, fr: null, nb, nbParams, o, tier, waste }
         }
       }
     }
@@ -219,16 +300,19 @@ export function nestJob(job: Job): NestResult {
       fr = best.fr
     } else {
       // 正式新板（库存扣减）
-      const nb = best.nb ?? pickNewBoard(p, best.o.pw, best.o.ph)
+      const nb = best.nb ?? pickNewBoard(p, best.o.pw, best.o.ph, assignedParams)
       if (!nb) {
         markUnplaced(p)
         continue
       }
-      s = openSheet(nb)
+      // 打开即锁定本张参数：余料板为自动件先开时沿用整单，为指定板种先开时沿用该板种
+      const lockParams = nb.kind === 'offcut' ? assignedParams : paramsOf(nb)
+      s = openSheet(nb, lockParams)
       openedCount.set(nb.id, (openedCount.get(nb.id) ?? 0) + 1)
       fr = s.free[0]
     }
     const o = best.o
+    const kerf = s.params.kerf
     // 占用该空档并按 guillotine 递归二分拆出余隙
     s.free = s.free.filter((f) => f.id !== fr.id)
     const rec: Rec = {
@@ -335,8 +419,8 @@ export function nestJob(job: Job): NestResult {
     })
   }
 
-  // 组装 SheetResult
-  const results: SheetResult[] = sheets.map((s) => buildSheet(s, kerf, trim))
+  // 组装 SheetResult（每张板带自己锁定的锯路/修边，作为后续刀路/统计/打印的唯一依据）
+  const results: SheetResult[] = sheets.map((s) => buildSheet(s))
 
   // 统计
   const boardsByType: Record<string, number> = {}
@@ -365,15 +449,16 @@ export function nestJob(job: Job): NestResult {
     code: u.part.code,
     name: u.part.name,
     qty: u.qty,
-    reason:
-      u.part.grain === 'none'
+    reason: conflictPartIds.has(u.part.id)
+      ? '锯路/修边取值差太多，与其他板种的件拼不到同一张板，且本板种板幅不足（见参数冲突提示）'
+      : u.part.grain === 'none'
         ? '板材尺寸或库存不足，无法排下'
         : u.part.grain === 'length'
           ? '因纹理要求为竖纹（不可旋转），现有板材排不下'
           : '因纹理要求为横纹（不可旋转），现有板材排不下'
   }))
 
-  const baselineBoards = shelfBaseline(job, boards, kerf, trim, results.length)
+  const baselineBoards = shelfBaseline(job, boards, results.length)
   const optimizedBoards = results.length
   const savedBoards = Math.max(0, baselineBoards - optimizedBoards)
   const stockShortage = boards
@@ -401,6 +486,7 @@ export function nestJob(job: Job): NestResult {
       normal: Math.round(normalM * 100) / 100
     },
     unplaced: unplacedList,
+    paramConflicts: conflicts,
     baselineBoards,
     savedBoards,
     savedCents: Math.round(savedBoards * avgPrice),
@@ -420,13 +506,15 @@ function segDepsOf(fr: FRect, s: SheetState): DSeg[] {
   return seg ? [seg] : []
 }
 
-function buildSheet(s: SheetState, kerf: number, trim: number): SheetResult {
+function buildSheet(s: SheetState): SheetResult {
   const raw: DSeg[] = []
   for (const r of s.recs) {
     if (r.segA) raw.push(r.segA)
     if (r.segB) raw.push(r.segB)
   }
   const b = s.board
+  const kerf = mm1(s.params.kerf)
+  const trim = mm1(s.params.trim)
   const steps = buildSteps(b.wMm, b.hMm, kerf, trim, s.index, raw)
   const boardArea = b.wMm * b.hMm
   const usedArea = s.placements.reduce((a, p) => a + p.origLen * p.origWid, 0)
@@ -453,6 +541,8 @@ function buildSheet(s: SheetState, kerf: number, trim: number): SheetResult {
     wMm: b.wMm,
     hMm: b.hMm,
     priceCents: b.kind === 'offcut' ? 0 : b.priceCents,
+    kerfMm: kerf,
+    trimMm: trim,
     placements: s.placements,
     steps,
     usedAreaMm2: usedArea,
@@ -474,17 +564,23 @@ function buildSheet(s: SheetState, kerf: number, trim: number): SheetResult {
 function shelfBaseline(
   job: Job,
   boards: Board[],
-  kerf: number,
-  trim: number,
   optimizedCount: number
 ): number {
   let count = 0
   // 用对象持有当前板状态，避免闭包对局部变量的窄化问题
-  const cur: { value: { b: Board; x: number; y: number; shelfH: number } | null } = { value: null }
-  const usable = (b: Board): [number, number] => [b.wMm - 2 * trim, b.hMm - 2 * trim]
+  const baseParams = jobParams(job)
+  const paramsOf = (b: Board): BoardParams => boardParamsCache.get(b.id) ?? baseParams
+  const cur: {
+    value: { b: Board; kerf: number; trim: number; x: number; y: number; shelfH: number } | null
+  } = { value: null }
+  const usable = (b: Board): [number, number] => {
+    const pa = paramsOf(b)
+    return [b.wMm - 2 * pa.trim, b.hMm - 2 * pa.trim]
+  }
   const newSheet = (b: Board): void => {
     count++
-    cur.value = { b, x: 0, y: 0, shelfH: 0 }
+    const pa = paramsOf(b)
+    cur.value = { b, kerf: pa.kerf, trim: pa.trim, x: 0, y: 0, shelfH: 0 }
   }
   // 随手排不用登记余料，只在常规板之间顺
   const canOpen = (b: Board): boolean => b.kind !== 'offcut'
@@ -498,18 +594,18 @@ function shelfBaseline(
         const [uw, uh] = usable(c.b)
         if (c.x + pw <= uw + EPS && c.y + Math.max(c.shelfH, ph) <= uh + EPS) {
           if (c.x === 0 && c.shelfH === 0) c.shelfH = ph
-          c.x += pw + kerf
+          c.x += pw + c.kerf
           c.shelfH = Math.max(c.shelfH, ph)
           return true
         }
         // 当前层放不下，换行再试
         if (c.x > 0) {
-          c.y += c.shelfH + kerf
+          c.y += c.shelfH + c.kerf
           c.x = 0
           c.shelfH = 0
           if (pw <= uw + EPS && c.y + ph <= uh + EPS) {
             c.shelfH = ph
-            c.x = pw + kerf
+            c.x = pw + c.kerf
             return true
           }
         }
@@ -519,17 +615,15 @@ function shelfBaseline(
         // 已摆入当前板
       } else {
         const candidates = boards
-          .filter(
-            (b) =>
-              canOpen(b) &&
-              boardMatches(b, part) &&
-              b.wMm - 2 * trim + EPS >= pw &&
-              b.hMm - 2 * trim + EPS >= ph
-          )
+          .filter((b) => {
+            if (!canOpen(b) || !boardMatches(b, part)) return false
+            const pa = paramsOf(b)
+            return b.wMm - 2 * pa.trim + EPS >= pw && b.hMm - 2 * pa.trim + EPS >= ph
+          })
           .sort((a, b) => a.wMm * a.hMm - b.wMm * b.hMm)
         if (candidates.length === 0) return Math.max(optimizedCount, count)
         newSheet(candidates[0])
-        cur.value!.x = pw + kerf
+        cur.value!.x = pw + cur.value!.kerf
         cur.value!.shelfH = ph
       }
     }

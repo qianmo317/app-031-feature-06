@@ -14,6 +14,9 @@ export interface Board {
   quantity: number // 库存张数，0 = 不限
   kind?: 'stock' | 'offcut' // stock 常规板材 / offcut 登记余料转来的小板
   offcutId?: string
+  // 逐板锯路/修边（mm，保留 1 位小数）；留空/undefined = 跟随整单 job.kerfMm/trimMm
+  kerfMm?: number
+  trimMm?: number
 }
 
 export interface Part {
@@ -80,6 +83,8 @@ export interface SheetResult {
   wMm: number
   hMm: number
   priceCents: number
+  kerfMm: number // 本张实际使用的锯路（逐板值或整单值）
+  trimMm: number // 本张实际使用的四周修边
   placements: Placement[]
   steps: CutStep[]
   usedAreaMm2: number
@@ -97,12 +102,24 @@ export interface UnplacedInfo {
   reason: string
 }
 
+export interface ParamConflict {
+  boardA: string
+  boardB: string
+  offcutName: string
+  kerfA: number
+  kerfB: number
+  trimA: number
+  trimB: number
+  message: string
+}
+
 export interface NestResult {
   sheets: SheetResult[]
   boardsUsed: number
   boardsByType: Record<string, number>
   edgeBandM: { exposed: number; normal: number }
   unplaced: UnplacedInfo[]
+  paramConflicts: ParamConflict[] // 锯路/修边差太多、无法拼同一张板的板种对
   baselineBoards: number // 随手排（朴素顺板）需要的张数
   savedBoards: number
   savedCents: number

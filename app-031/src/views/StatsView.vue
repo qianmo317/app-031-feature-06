@@ -80,21 +80,25 @@ const utilMinMax = computed(() => {
         <h3>板材领料</h3>
         <table class="grid">
           <thead>
-            <tr><th>板材</th><th>张数</th><th>单价</th><th>小计</th></tr>
+            <tr><th>板材</th><th>张数</th><th>锯路(mm)</th><th>修边(mm)</th><th>单价</th><th>小计</th></tr>
           </thead>
           <tbody>
             <tr v-for="(n, name) in result.boardsByType" :key="name">
               <td>{{ name }}</td>
               <td>{{ n }}</td>
+              <td>{{ (result.sheets.find((x) => x.boardName === name)?.kerfMm ?? 0).toFixed(1) }}</td>
+              <td>{{ (result.sheets.find((x) => x.boardName === name)?.trimMm ?? 0).toFixed(1) }}</td>
               <td>{{ money(result.sheets.find((x) => x.boardName === name)?.priceCents ?? 0) }}</td>
               <td>{{ money((result.sheets.find((x) => x.boardName === name)?.priceCents ?? 0) * Number(n)) }}</td>
             </tr>
           </tbody>
           <tfoot>
-            <tr><td colspan="3"><b>板材成本合计</b></td><td><b>{{ money(result.totalCostCents) }}</b></td></tr>
+            <tr><td colspan="5"><b>板材成本合计</b></td><td><b>{{ money(result.totalCostCents) }}</b></td></tr>
           </tfoot>
         </table>
-        <p class="small muted" style="margin-top: 8px">排样计算耗时 {{ result.elapsedMs }}ms。</p>
+        <p class="small muted" style="margin-top: 8px">
+          锯路/修边为每种板自己排样时实际使用的取值（留空的板跟整单）。排样计算耗时 {{ result.elapsedMs }}ms。
+        </p>
       </section>
 
       <section class="panel">

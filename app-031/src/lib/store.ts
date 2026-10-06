@@ -4,6 +4,7 @@ import type { Board, Job, NestResult, Part, RegisteredOffcut, SheetResult } from
 import { nestJob } from './packing'
 import { rebuildFromPlacements } from './cuts'
 import { guillotineViolation } from './geometry'
+import { mm1 } from './params'
 import { uid } from './format'
 import boardsData from '../data/boards.json'
 
@@ -43,7 +44,47 @@ function init(): void {
   if (state.loaded) return
   state.jobs = load<Job[]>(JOBS_KEY, [])
   state.offcuts = load<RegisteredOffcut[]>(OFFCUTS_KEY, [])
+  // 旧版本项目没有逐板 kerfMm/trimMm，也可能没有逐张结果参数：
+  // 统一补默认/置空，保证「缺字段也能打开，按整单那一套接着用」。
+  state.jobs.forEach(normalizeJob)
   state.loaded = true
+}
+
+function num1OrUndef(v: unknown): number | undefined {
+  if (typeof v !== 'number' || !Number.isFinite(v)) return undefined
+  if (v <= 0) return undefined
+  return mm1(v)
+}
+
+/** 补齐逐板锯路/修边字段；旧数据缺字段时保持 undefined（= 跟随整单）。 */
+export function normalizeJob(job: Job): Job {
+  if (!Array.isArray(job.boards)) job.boards = []
+  if (typeof job.kerfMm !== 'number' || !Number.isFinite(job.kerfMm) || job.kerfMm <= 0)
+    job.kerfMm = boardsData.defaults.kerfMm
+  if (typeof job.trimMm !== 'number' || !Number.isFinite(job.trimMm) || job.trimMm < 0)
+    job.trimMm = boardsData.defaults.trimMm
+  job.kerfMm = mm1(job.kerfMm)
+  job.trimMm = mm1(job.trimMm)
+  for (const b of job.boards) {
+    b.kerfMm = num1OrUndef(b.kerfMm)
+    if (typeof b.trimMm === 'number' && Number.isFinite(b.trimMm) && b.trimMm >= 0)
+      b.trimMm = mm1(b.trimMm)
+    else b.trimMm = undefined
+  }
+  if (!Array.isArray(job.useOffcutIds)) job.useOffcutIds = []
+  if (job.result) normalizeResult(job, job.result)
+  return job
+}
+
+/** 旧排样结果没有逐张 kerfMm/trimMm/paramConflicts 时补齐，让旧结果也能直接查看。 */
+function normalizeResult(job: Job, r: NestResult): void {
+  for (const s of r.sheets ?? []) {
+    if (typeof s.kerfMm !== 'number' || s.kerfMm <= 0) s.kerfMm = job.kerfMm
+    if (typeof s.trimMm !== 'number' || s.trimMm < 0) s.trimMm = job.trimMm
+    s.kerfMm = mm1(s.kerfMm)
+    s.trimMm = mm1(s.trimMm)
+  }
+  if (!Array.isArray(r.paramConflicts)) r.paramConflicts = []
 }
 
 export function defaultBoards(): Board[] {
@@ -139,6 +180,7 @@ function boardsWithOffcuts(job: Job): Board[] {
 }
 
 export function runNest(job: Job): NestResult {
+  normalizeJob(job)
   const effective: Job = { ...job, boards: boardsWithOffcuts(job) }
   const result = nestJob(effective)
   // 标记被用掉的余料
@@ -156,6 +198,33 @@ export function runNest(job: Job): NestResult {
   return result
 }
 
+/**
+ * 修改整单或某一种板的锯路/修边（mm，保留 1 位小数）。
+ * 逐板填了就用板的，清空（null）则回到「跟随整单」；
+ * 若项目已排样，立即用新参数重算一遍，保证排样/刀路/统计/打印同一个结论。
+ */
+export function updateCutParams(input: {
+  job: Job
+  boardId?: string
+  kerf?: number | null
+  trim?: number | null
+}): void {
+  const { job, boardId } = input
+  normalizeJob(job)
+  const board = boardId ? job.boards.find((b) => b.id === boardId) : undefined
+  if (board) {
+    if (input.kerf !== undefined) board.kerfMm = input.kerf === null ? undefined : mm1(input.kerf)
+    if (input.trim !== undefined) board.trimMm = input.trim === null ? undefined : mm1(input.trim)
+  } else {
+    if (input.kerf !== undefined && input.kerf !== null && input.kerf > 0)
+      job.kerfMm = mm1(input.kerf)
+    if (input.trim !== undefined && input.trim !== null && input.trim >= 0)
+      job.trimMm = mm1(input.trim)
+  }
+  if (job.result) runNest(job)
+  else persist()
+}
+
 /** 手工微调：移动/交换后重新校验 guillotine 并重算刀路；非法返回错误信息。 */
 export function applyAdjustment(
   job: Job,
@@ -164,23 +233,26 @@ export function applyAdjustment(
 ): string | null {
   if (!job.result) return '尚未排样'
   const sheet = job.result.sheets[sheetIndex]
+  // 微调重算必须沿用这张板自己排样时锁定的锯路/修边（可能与整单不同）
+  const kerf = sheet.kerfMm ?? job.kerfMm
+  const trim = sheet.trimMm ?? job.trimMm
   const bounds = {
-    x: job.trimMm,
-    y: job.trimMm,
-    w: sheet.wMm - 2 * job.trimMm,
-    h: sheet.hMm - 2 * job.trimMm
+    x: trim,
+    y: trim,
+    w: sheet.wMm - 2 * trim,
+    h: sheet.hMm - 2 * trim
   }
   const violation = guillotineViolation(
     placements.map((p) => ({ id: p.instanceId, x: p.x, y: p.y, w: p.lenMm, h: p.widMm })),
     bounds,
-    job.kerfMm
+    kerf
   )
   if (violation) return violation
   const rebuilt = rebuildFromPlacements(
     sheet.wMm,
     sheet.hMm,
-    job.kerfMm,
-    job.trimMm,
+    kerf,
+    trim,
     sheetIndex,
     placements
   )
@@ -367,6 +439,7 @@ export function importJobJson(json: string): Job | null {
     obj.id = uid('job')
     obj.createdAt = Date.now()
     obj.result = undefined
+    normalizeJob(obj)
     state.jobs.unshift(obj)
     persist()
     return obj

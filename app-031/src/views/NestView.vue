@@ -2,9 +2,10 @@
 import { computed, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import { getJob, runNest, applyAdjustment, registerOffcuts, useStore } from '../lib/store'
+import { sheetKerf, sheetTrim } from '../lib/params'
 import { toast } from '../lib/ui'
 import { printJob } from '../lib/print'
-import { pct, money } from '../lib/format'
+import { pct, money, mm1 } from '../lib/format'
 import SheetDiagram from '../components/SheetDiagram.vue'
 import { cabinetFill, cabinetStroke } from '../lib/colors'
 
@@ -27,6 +28,24 @@ const cabinets = computed(() => {
   const set = new Set<string>()
   result.value?.sheets.forEach((s) => s.placements.forEach((p) => set.add(p.cabinet)))
   return [...set].sort()
+})
+
+// 各张板生效的锯路/修边分组：超过一套时明确提示（每张板已按自己的参数排版下刀）
+const sheetParamGroups = computed(() => {
+  const j = job.value
+  if (!j || !result.value) return []
+  const groups: { kerf: number; trim: number; names: string[] }[] = []
+  for (const s of result.value.sheets) {
+    const kerf = sheetKerf(s, j)
+    const trim = sheetTrim(s, j)
+    const hit = groups.find((g) => g.kerf === kerf && g.trim === trim)
+    if (hit) {
+      if (!hit.names.includes(s.boardName)) hit.names.push(s.boardName)
+    } else {
+      groups.push({ kerf, trim, names: [s.boardName] })
+    }
+  }
+  return groups
 })
 
 // 已登记余料：以 (项目, 板, 尺寸) 判重
@@ -163,6 +182,12 @@ function printNest(): void {
     </div>
     <div v-for="sh in result.stockShortage" :key="sh.boardId" class="alert warn">
       库存不足：{{ sh.boardName }} 需要 {{ sh.need }} 张，库存仅 {{ sh.have }} 张，请补采 {{ sh.need - sh.have }} 张。
+    </div>
+    <div v-if="sheetParamGroups.length > 1" class="alert info">
+      本单各板种锯路/修边不同，每张板已按自己的参数扣余隙、生成修边刀：
+      <span v-for="(g, i) in sheetParamGroups" :key="i" class="alert-item">
+        {{ g.names.join('、') }} — 锯路 {{ mm1(g.kerf) }}mm / 修边 {{ mm1(g.trim) }}mm
+      </span>
     </div>
 
     <div class="layout">
@@ -314,6 +339,11 @@ function printNest(): void {
   background: #fffbeb;
   border: 1px solid #f0d9b5;
   color: #92600a;
+}
+.alert.info {
+  background: #eff6ff;
+  border: 1px solid #bfdbfe;
+  color: #1d4ed8;
 }
 .alert-item {
   margin-right: 14px;

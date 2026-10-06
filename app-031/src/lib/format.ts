@@ -12,6 +12,11 @@ export function mm(v: number): string {
   return `${Math.round(v)}`
 }
 
+/** 毫米数值保留 1 位小数（锯路/修边/刀路位置用） */
+export function mm1(v: number): string {
+  return (Math.round(v * 10) / 10).toFixed(1)
+}
+
 export function areaM2(mm2: number): string {
   return `${(mm2 / 1_000_000).toFixed(2)}m²`
 }

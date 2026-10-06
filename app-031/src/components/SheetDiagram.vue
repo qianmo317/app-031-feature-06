@@ -57,6 +57,8 @@ const stepsShown = computed(() => {
 })
 
 const trim = computed(() => {
+  // 优先用该张板排样时的修边快照；老数据没有快照时从修边刀位置反推
+  if (props.sheet.trimMm !== undefined) return props.sheet.trimMm
   const st0 = props.sheet.steps.find((s) => s.kind === 'trim')
   if (!st0) return 8
   return Math.round(st0.at)

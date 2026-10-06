@@ -14,6 +14,9 @@ export interface Board {
   quantity: number // 库存张数，0 = 不限
   kind?: 'stock' | 'offcut' // stock 常规板材 / offcut 登记余料转来的小板
   offcutId?: string
+  // 板级锯路/修边覆盖（mm，1 位小数）；留空 = 跟随整单 job.kerfMm / job.trimMm
+  kerfMm?: number
+  trimMm?: number
 }
 
 export interface Part {
@@ -87,6 +90,10 @@ export interface SheetResult {
   utilization: number
   offcuts: OffcutInfo[]
   adjusted?: boolean
+  // 本张板排版/刀路实际采用的锯路与修边快照（mm，1 位小数）；
+  // 老项目结果没有这两个字段，读取时回落整单值
+  kerfMm?: number
+  trimMm?: number
 }
 
 export interface UnplacedInfo {

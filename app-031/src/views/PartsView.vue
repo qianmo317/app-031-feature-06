@@ -9,7 +9,8 @@ import {
   newPart,
   allStockTemplates
 } from '../lib/store'
-import { uid, parsePartText, parseEdges, money } from '../lib/format'
+import { uid, parsePartText, parseEdges, money, mm1, clamp } from '../lib/format'
+import { boardTrim, distinctBoardParams, paramsDiverge, round1 } from '../lib/params'
 import { toast } from '../lib/ui'
 import type { Board, EdgeSide, Part } from '../types'
 
@@ -45,6 +46,48 @@ const availableOffcuts = computed(() => state.offcuts.filter((o) => o.available)
 
 function save(): void {
   if (job.value) saveJob(job.value)
+}
+
+// —— 锯路/修边：整单一整套，每种板可在自己行里覆盖；改任意一处都按新值重算 ——
+const PARAM_RANGE = { kerfMm: [1, 8], trimMm: [0, 20] } as const
+
+function onParamChange(): void {
+  const j = job.value
+  if (!j) return
+  save()
+  // 已有排样结果时立即按新参数重算，排样/刀路/统计/打印保持同一套结论
+  if (j.result) {
+    runNest(j)
+    toast('锯路/修边已更新，已按新参数重新排样', 'good')
+  }
+}
+
+function onJobParam(key: 'kerfMm' | 'trimMm'): void {
+  const j = job.value
+  if (!j) return
+  const [lo, hi] = PARAM_RANGE[key]
+  const v = Number(j[key])
+  j[key] = Number.isFinite(v) ? clamp(round1(v), lo, hi) : lo
+  onParamChange()
+}
+
+function onBoardParam(b: Board, key: 'kerfMm' | 'trimMm', e: Event): void {
+  const el = e.target as HTMLInputElement
+  const raw = el.value.trim()
+  if (raw === '') {
+    b[key] = undefined // 留空 = 跟随整单
+  } else {
+    const v = Number(raw)
+    if (!Number.isFinite(v)) {
+      el.value = b[key] !== undefined ? String(b[key]) : ''
+      toast('锯路/修边需为数字，留空则跟随整单', 'bad')
+      return
+    }
+    const [lo, hi] = PARAM_RANGE[key]
+    b[key] = clamp(round1(v), lo, hi)
+    el.value = String(b[key])
+  }
+  onParamChange()
 }
 
 function addBoard(): void {
@@ -117,8 +160,9 @@ const warnings = computed<string[]>(() => {
   const out: string[] = []
   const j = job.value
   if (!j) return out
-  const maxW = Math.max(...j.boards.map((b) => b.wMm - 2 * j.trimMm))
-  const maxH = Math.max(...j.boards.map((b) => b.hMm - 2 * j.trimMm))
+  // 可用板幅按每种板自己的修边扣
+  const maxW = Math.max(...j.boards.map((b) => b.wMm - 2 * boardTrim(b, j)))
+  const maxH = Math.max(...j.boards.map((b) => b.hMm - 2 * boardTrim(b, j)))
   for (const p of j.parts) {
     const long = Math.max(p.lenMm, p.widMm)
     const short = Math.min(p.lenMm, p.widMm)
@@ -130,7 +174,25 @@ const warnings = computed<string[]>(() => {
       out.push(`「${p.code}」长边 ${long} 超过板长 ${maxW}`)
     void short
   }
-  if (j.trimMm < 5 || j.trimMm > 10) out.push('修边量通常取 5~10mm')
+  const trimOdd = j.boards.some((b) => {
+    const t = boardTrim(b, j)
+    return t < 5 || t > 10
+  })
+  if (trimOdd) out.push('修边量通常取 5~10mm')
+  // 各板种锯路/修边差太多：明确提示不会拼到同一张板，绝不悄悄按其中一套算
+  const sets = distinctBoardParams(j)
+  if (sets.length > 1) {
+    const divergent = sets.some((a, i) => sets.slice(i + 1).some((b) => paramsDiverge(a, b)))
+    if (divergent) {
+      const kerfs = sets.map((s) => s.kerf)
+      const trims = sets.map((s) => s.trim)
+      out.push(
+        `各板种锯路/修边取值相差较大（锯路 ${mm1(Math.min(...kerfs))}~${mm1(Math.max(...kerfs))}mm、` +
+          `修边 ${mm1(Math.min(...trims))}~${mm1(Math.max(...trims))}mm）：不同板种的零件不会拼到同一张板，` +
+          `每张板按自己的参数扣锯路与修边；未指定板材的零件排到哪种板就按哪种板的参数算。`
+      )
+    }
+  }
   return out
 })
 
@@ -207,17 +269,21 @@ const sampleTsv = `名称\t长\t宽\t数量\t纹理\t封边\t柜体\t见光
       <div class="row wrap" style="align-items: flex-end">
         <label class="field" style="width: 130px">
           <span>锯路 kerf (mm)</span>
-          <input v-model.number="job.kerfMm" type="number" step="0.1" min="1" max="8" @change="save" />
+          <input v-model.number="job.kerfMm" type="number" step="0.1" min="1" max="8" @change="onJobParam('kerfMm')" />
         </label>
         <label class="field" style="width: 130px">
           <span>四周修边 (mm)</span>
-          <input v-model.number="job.trimMm" type="number" step="1" min="0" max="20" @change="save" />
+          <input v-model.number="job.trimMm" type="number" step="0.1" min="0" max="20" @change="onJobParam('trimMm')" />
         </label>
         <label class="field row" style="margin-bottom: 10px">
           <input type="checkbox" v-model="job.batchByCabinet" @change="save" />
           <span style="margin: 0 0 0 6px">按柜体批次分组开料（同柜零件尽量连续排）</span>
         </label>
       </div>
+      <p class="small muted" style="margin: 0 0 4px">
+        上面两项是整单默认值；板材库每行可填自己的锯路/修边（留空 = 跟随整单）。
+        改动任意一项都会按新参数自动重算排样。
+      </p>
       <div v-if="availableOffcuts.length > 0">
         <h4 style="margin: 8px 0 6px; font-size: 13px">余料优先：勾选已登记余料作为小板材参与本单排样</h4>
         <div class="row wrap">
@@ -249,6 +315,7 @@ const sampleTsv = `名称\t长\t宽\t数量\t纹理\t封边\t柜体\t见光
         <thead>
           <tr>
             <th>名称/材质</th><th>长(mm)</th><th>宽(mm)</th><th>厚(mm)</th>
+            <th>锯路(mm)</th><th>修边(mm)</th>
             <th>单价</th><th>库存张数(0=不限)</th><th></th>
           </tr>
         </thead>
@@ -261,12 +328,40 @@ const sampleTsv = `名称\t长\t宽\t数量\t纹理\t封边\t柜体\t见光
             <td style="width: 96px"><input v-model.number="b.wMm" type="number" @change="save" /></td>
             <td style="width: 96px"><input v-model.number="b.hMm" type="number" @change="save" /></td>
             <td style="width: 84px"><input v-model.number="b.thicknessMm" type="number" @change="save" /></td>
+            <td style="width: 92px">
+              <input
+                :value="b.kerfMm ?? ''"
+                type="number"
+                step="0.1"
+                min="1"
+                max="8"
+                :placeholder="mm1(job.kerfMm)"
+                title="留空 = 跟随整单锯路"
+                @change="onBoardParam(b, 'kerfMm', $event)"
+              />
+            </td>
+            <td style="width: 92px">
+              <input
+                :value="b.trimMm ?? ''"
+                type="number"
+                step="0.1"
+                min="0"
+                max="20"
+                :placeholder="mm1(job.trimMm)"
+                title="留空 = 跟随整单修边"
+                @change="onBoardParam(b, 'trimMm', $event)"
+              />
+            </td>
             <td style="width: 110px"><input v-model.number="b.priceCents" type="number" @change="save" /></td>
             <td style="width: 130px"><input v-model.number="b.quantity" type="number" min="0" @change="save" /></td>
             <td style="width: 46px"><button class="sm ghost-danger" @click="removeBoard(b.id)">删</button></td>
           </tr>
         </tbody>
       </table>
+      <p class="small muted" style="margin: 6px 0 0">
+        锯路/修边两列留空表示跟随整单（当前 {{ mm1(job.kerfMm) }} / {{ mm1(job.trimMm) }}mm）；
+        填了的板种按自己的值排版下刀，整单值再改也不影响它。
+      </p>
     </section>
 
     <!-- 零件清单 -->

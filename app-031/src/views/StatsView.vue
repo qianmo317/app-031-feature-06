@@ -2,12 +2,15 @@
 import { computed } from 'vue'
 import { useRoute } from 'vue-router'
 import { getJob } from '../lib/store'
+import { sheetKerf, sheetTrim } from '../lib/params'
 import boardsData from '../data/boards.json'
-import { pct, money } from '../lib/format'
+import { pct, money, mm1 } from '../lib/format'
 
 const route = useRoute()
 const job = computed(() => getJob(route.params.id as string))
 const result = computed(() => job.value?.result)
+
+const sheetOf = (name: string) => result.value?.sheets.find((x) => x.boardName === name)
 
 const totalPieces = computed(
   () => result.value?.sheets.reduce((a, s) => a + s.placements.length, 0) ?? 0
@@ -80,18 +83,23 @@ const utilMinMax = computed(() => {
         <h3>板材领料</h3>
         <table class="grid">
           <thead>
-            <tr><th>板材</th><th>张数</th><th>单价</th><th>小计</th></tr>
+            <tr><th>板材</th><th>张数</th><th>锯路/修边(mm)</th><th>单价</th><th>小计</th></tr>
           </thead>
           <tbody>
             <tr v-for="(n, name) in result.boardsByType" :key="name">
               <td>{{ name }}</td>
               <td>{{ n }}</td>
+              <td>
+                <template v-if="sheetOf(String(name)) && job">
+                  {{ mm1(sheetKerf(sheetOf(String(name))!, job)) }} / {{ mm1(sheetTrim(sheetOf(String(name))!, job)) }}
+                </template>
+              </td>
               <td>{{ money(result.sheets.find((x) => x.boardName === name)?.priceCents ?? 0) }}</td>
               <td>{{ money((result.sheets.find((x) => x.boardName === name)?.priceCents ?? 0) * Number(n)) }}</td>
             </tr>
           </tbody>
           <tfoot>
-            <tr><td colspan="3"><b>板材成本合计</b></td><td><b>{{ money(result.totalCostCents) }}</b></td></tr>
+            <tr><td colspan="4"><b>板材成本合计</b></td><td><b>{{ money(result.totalCostCents) }}</b></td></tr>
           </tfoot>
         </table>
         <p class="small muted" style="margin-top: 8px">排样计算耗时 {{ result.elapsedMs }}ms。</p>

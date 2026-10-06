@@ -2,9 +2,10 @@
 import { computed } from 'vue'
 import { printState } from '../lib/print'
 import { getJob } from '../lib/store'
+import { sheetKerf, sheetTrim } from '../lib/params'
 import boardsData from '../data/boards.json'
 import SheetDiagram from './SheetDiagram.vue'
-import { money, mm } from '../lib/format'
+import { money, mm, mm1 } from '../lib/format'
 
 const job = computed(() => (printState.jobId ? getJob(printState.jobId) : undefined))
 const sections = computed(() => new Set(printState.sections))
@@ -67,7 +68,7 @@ const boardByName = (name: string) =>
         <p class="doc-meta">
           {{ s.boardName }}（{{ s.material }} {{ s.thicknessMm }}mm） · 尺寸
           {{ s.wMm }}×{{ s.hMm }}mm · 利用率 {{ (s.utilization * 100).toFixed(1) }}% ·
-          锯路 {{ job.kerfMm }}mm · 修边 {{ job.trimMm }}mm
+          锯路 {{ mm1(sheetKerf(s, job)) }}mm · 修边 {{ mm1(sheetTrim(s, job)) }}mm
         </p>
         <div class="print-sheet-wrap">
           <SheetDiagram :sheet="s" :show-cuts="false" print-mode />
@@ -103,7 +104,10 @@ const boardByName = (name: string) =>
         class="print-page"
       >
         <h2>裁切步骤表 · 第 {{ s.index + 1 }} 张（{{ s.boardName }}）</h2>
-        <p class="doc-meta">按顺序下锯；同向刀已连续排程（减少推台翻转）；修边刀可多板叠切。</p>
+        <p class="doc-meta">
+          按顺序下锯；同向刀已连续排程（减少推台翻转）；修边刀可多板叠切。
+          本板锯路 {{ mm1(sheetKerf(s, job)) }}mm · 修边 {{ mm1(sheetTrim(s, job)) }}mm。
+        </p>
         <table class="pgrid">
           <thead>
             <tr><th>刀序</th><th>类型</th><th>方向</th><th>位置(mm)</th><th>贯通区间(mm)</th><th>说明</th></tr>
@@ -113,7 +117,7 @@ const boardByName = (name: string) =>
               <td>{{ st.order + 1 }}</td>
               <td>{{ st.kind === 'trim' ? '修边' : '裁切' }}</td>
               <td>{{ st.axis === 'v' ? '竖刀' : '横刀' }}</td>
-              <td>{{ Math.round(st.at) }}</td>
+              <td>{{ mm1(st.at) }}</td>
               <td>{{ st.span[0] }} ~ {{ st.span[1] }}</td>
               <td>{{ st.label }}</td>
             </tr>
@@ -131,7 +135,7 @@ const boardByName = (name: string) =>
         <h3>一、板材领料</h3>
         <table class="pgrid">
           <thead>
-            <tr><th>板材</th><th>规格(mm)</th><th>厚度</th><th>张数</th><th>单价</th><th>小计</th></tr>
+            <tr><th>板材</th><th>规格(mm)</th><th>厚度</th><th>张数</th><th>锯路/修边(mm)</th><th>单价</th><th>小计</th></tr>
           </thead>
           <tbody>
             <tr v-for="(n, name) in job.result?.boardsByType" :key="name">
@@ -139,13 +143,18 @@ const boardByName = (name: string) =>
               <td>{{ boardByName(String(name))?.wMm }}×{{ boardByName(String(name))?.hMm }}</td>
               <td>{{ boardByName(String(name))?.thicknessMm }}</td>
               <td>{{ n }}</td>
+              <td>
+                <template v-if="boardByName(String(name))">
+                  {{ mm1(sheetKerf(boardByName(String(name))!, job)) }} / {{ mm1(sheetTrim(boardByName(String(name))!, job)) }}
+                </template>
+              </td>
               <td>{{ money(boardByName(String(name))?.priceCents ?? 0) }}</td>
               <td>{{ money((boardByName(String(name))?.priceCents ?? 0) * Number(n)) }}</td>
             </tr>
           </tbody>
           <tfoot>
             <tr>
-              <td colspan="5">板材合计</td>
+              <td colspan="6">板材合计</td>
               <td>{{ money(job.result?.totalCostCents ?? 0) }}</td>
             </tr>
           </tfoot>

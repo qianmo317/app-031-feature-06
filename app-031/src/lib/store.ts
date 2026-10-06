@@ -4,6 +4,7 @@ import type { Board, Job, NestResult, Part, RegisteredOffcut, SheetResult } from
 import { nestJob } from './packing'
 import { rebuildFromPlacements } from './cuts'
 import { guillotineViolation } from './geometry'
+import { sheetKerf, sheetTrim } from './params'
 import { uid } from './format'
 import boardsData from '../data/boards.json'
 
@@ -122,7 +123,10 @@ export function getJob(id: string): Job | undefined {
 /** 把勾选的登记余料转成本单可用的小板（排在板材列表前，优先消耗）。 */
 function boardsWithOffcuts(job: Job): Board[] {
   const offcutBoards: Board[] = state.offcuts
-    .filter((o) => o.available && job.useOffcutIds.includes(o.id))
+    .filter(
+      (o) =>
+        job.useOffcutIds.includes(o.id) && (o.available || o.usedByJobId === job.id)
+    )
     .map((o) => ({
       id: `offcut_${o.id}`,
       name: `余料板 ${o.wMm}×${o.hMm}×${o.thicknessMm}（${o.material}）`,
@@ -141,7 +145,13 @@ function boardsWithOffcuts(job: Job): Board[] {
 export function runNest(job: Job): NestResult {
   const effective: Job = { ...job, boards: boardsWithOffcuts(job) }
   const result = nestJob(effective)
-  // 标记被用掉的余料
+  // 先释放本单上一轮用掉的余料，再按本轮结果重新标记（重复排样幂等）
+  for (const oc of state.offcuts) {
+    if (oc.usedByJobId === job.id) {
+      oc.available = true
+      oc.usedByJobId = undefined
+    }
+  }
   const usedOffcutBoardIds = new Set(
     result.sheets.filter((s) => s.boardId.startsWith('offcut_')).map((s) => s.boardId)
   )
@@ -164,23 +174,26 @@ export function applyAdjustment(
 ): string | null {
   if (!job.result) return '尚未排样'
   const sheet = job.result.sheets[sheetIndex]
+  // 用该张板排样时的锯路/修边快照校验与重算，保证和刀路、统计用同一套参数
+  const kerf = sheetKerf(sheet, job)
+  const trim = sheetTrim(sheet, job)
   const bounds = {
-    x: job.trimMm,
-    y: job.trimMm,
-    w: sheet.wMm - 2 * job.trimMm,
-    h: sheet.hMm - 2 * job.trimMm
+    x: trim,
+    y: trim,
+    w: sheet.wMm - 2 * trim,
+    h: sheet.hMm - 2 * trim
   }
   const violation = guillotineViolation(
     placements.map((p) => ({ id: p.instanceId, x: p.x, y: p.y, w: p.lenMm, h: p.widMm })),
     bounds,
-    job.kerfMm
+    kerf
   )
   if (violation) return violation
   const rebuilt = rebuildFromPlacements(
     sheet.wMm,
     sheet.hMm,
-    job.kerfMm,
-    job.trimMm,
+    kerf,
+    trim,
     sheetIndex,
     placements
   )
@@ -282,7 +295,10 @@ export function createSampleJob(): Job {
     material: bBack.material,
     priceCents: bBack.priceCents,
     quantity: 0,
-    kind: 'stock'
+    kind: 'stock',
+    // 9mm 背板薄，锯路/修边自设一套（不跟随整单）
+    kerfMm: 2.0,
+    trimMm: 4.0
   }
   job.boards.push(back)
   const P = (

@@ -3,6 +3,8 @@ import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { getJob } from '../lib/store'
 import { countSawOps } from '../lib/cuts'
+import { sheetKerf, sheetTrim } from '../lib/params'
+import { mm1 } from '../lib/format'
 import { printJob } from '../lib/print'
 import SheetDiagram from '../components/SheetDiagram.vue'
 
@@ -92,6 +94,9 @@ function printCut(): void {
         <input type="range" min="180" max="1600" step="20" v-model.number="speed" style="width: 130px" />
       </label>
       <div class="spacer" />
+      <span v-if="sheet && job" class="tag">
+        本板锯路 {{ mm1(sheetKerf(sheet, job)) }}mm · 修边 {{ mm1(sheetTrim(sheet, job)) }}mm
+      </span>
       <span class="tag">车间实际工步 {{ sawOps }}（{{ partCount }} 件，同向已连续排程）</span>
       <button class="sm" @click="printCut">打印裁切步骤表</button>
     </section>

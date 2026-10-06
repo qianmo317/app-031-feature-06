@@ -15,6 +15,7 @@ import type {
 import { EPS, type Rect } from './geometry'
 import { buildSteps, simulate } from './cuts'
 import type { DSeg } from './cuts'
+import { boardKerf, boardTrim } from './params'
 
 interface Inst {
   part: Part
@@ -46,6 +47,8 @@ interface SheetState {
   board: Board
   index: number
   usable: Rect
+  kerf: number // 本张板生效锯路（板级覆盖优先，否则整单）
+  trim: number // 本张板生效修边
   free: FRect[]
   recs: Rec[]
   placements: Placement[]
@@ -74,8 +77,9 @@ export function nestJob(job: Job): NestResult {
   boardDefs.clear()
   const boards = job.boards.map(normalize)
   boards.forEach((b) => boardDefs.set(b.id, b))
-  const kerf = job.kerfMm
-  const trim = job.trimMm
+  // 每种板的生效锯路/修边：板级覆盖优先，未填的跟随整单
+  const kerfOf = (b: Board): number => boardKerf(b, job)
+  const trimOf = (b: Board): number => boardTrim(b, job)
 
   // 各板种实际开板数（用于库存补采提示）
   const openedCount = new Map<string, number>()
@@ -99,6 +103,7 @@ export function nestJob(job: Job): NestResult {
   const sheets: SheetState[] = []
   let frSeq = 0
   const openSheet = (b: Board): SheetState => {
+    const trim = trimOf(b)
     const usable: Rect = {
       x: trim,
       y: trim,
@@ -109,6 +114,8 @@ export function nestJob(job: Job): NestResult {
       board: b,
       index: sheets.length,
       usable,
+      kerf: kerfOf(b),
+      trim,
       free: [
         {
           id: frSeq++,
@@ -141,8 +148,8 @@ export function nestJob(job: Job): NestResult {
       (b) =>
         canOpen(b) &&
         boardMatches(b, p) &&
-        fitsClean(b.wMm - 2 * trim, pw) &&
-        fitsClean(b.hMm - 2 * trim, ph)
+        fitsClean(b.wMm - 2 * trimOf(b), pw, kerfOf(b)) &&
+        fitsClean(b.hMm - 2 * trimOf(b), ph, kerfOf(b))
     )
     // 余料小板优先，其次选面积最小的（省大板）
     viable.sort((a, b) => {
@@ -158,7 +165,7 @@ export function nestJob(job: Job): NestResult {
     rotated: boolean
   }
   // 只允许严丝合缝（0）或余隙 ≥ 锯路；0<余隙<锯路 时下不了刀，禁止放入
-  const fitsClean = (avail: number, size: number): boolean => {
+  const fitsClean = (avail: number, size: number, kerf: number): boolean => {
     const gap = avail - size
     return gap >= -EPS && (gap <= EPS || gap >= kerf - EPS)
   }
@@ -190,7 +197,7 @@ export function nestJob(job: Job): NestResult {
       for (const s of sheets) {
         if (!boardMatches(s.board, p)) continue
         for (const fr of s.free) {
-          if (fitsClean(fr.w, o.pw) && fitsClean(fr.h, o.ph)) {
+          if (fitsClean(fr.w, o.pw, s.kerf) && fitsClean(fr.h, o.ph, s.kerf)) {
             const waste = fr.w * fr.h - o.pw * o.ph
             if (!best || waste < best.waste) {
               best = { sheet: s, fr, nb: null, o, tier: 0, waste }
@@ -202,7 +209,7 @@ export function nestJob(job: Job): NestResult {
       const nb = pickNewBoard(p, o.pw, o.ph)
       if (nb) {
         const tier = nb.kind === 'offcut' ? 1 : 2
-        const waste = (nb.wMm - 2 * trim) * (nb.hMm - 2 * trim) - o.pw * o.ph
+        const waste = (nb.wMm - 2 * trimOf(nb)) * (nb.hMm - 2 * trimOf(nb)) - o.pw * o.ph
         if (!best || tier < best.tier || (tier === best.tier && waste < best.waste)) {
           best = { sheet: null, fr: null, nb, o, tier, waste }
         }
@@ -229,7 +236,8 @@ export function nestJob(job: Job): NestResult {
       fr = s.free[0]
     }
     const o = best.o
-    // 占用该空档并按 guillotine 递归二分拆出余隙
+    // 占用该空档并按 guillotine 递归二分拆出余隙（锯路按本张板的生效值扣）
+    const kerf = s.kerf
     s.free = s.free.filter((f) => f.id !== fr.id)
     const rec: Rec = {
       id: s.recs.length,
@@ -335,8 +343,8 @@ export function nestJob(job: Job): NestResult {
     })
   }
 
-  // 组装 SheetResult
-  const results: SheetResult[] = sheets.map((s) => buildSheet(s, kerf, trim))
+  // 组装 SheetResult（每张板带自己的锯路/修边快照）
+  const results: SheetResult[] = sheets.map((s) => buildSheet(s))
 
   // 统计
   const boardsByType: Record<string, number> = {}
@@ -373,7 +381,7 @@ export function nestJob(job: Job): NestResult {
           : '因纹理要求为横纹（不可旋转），现有板材排不下'
   }))
 
-  const baselineBoards = shelfBaseline(job, boards, kerf, trim, results.length)
+  const baselineBoards = shelfBaseline(job, boards, results.length)
   const optimizedBoards = results.length
   const savedBoards = Math.max(0, baselineBoards - optimizedBoards)
   const stockShortage = boards
@@ -420,13 +428,15 @@ function segDepsOf(fr: FRect, s: SheetState): DSeg[] {
   return seg ? [seg] : []
 }
 
-function buildSheet(s: SheetState, kerf: number, trim: number): SheetResult {
+function buildSheet(s: SheetState): SheetResult {
   const raw: DSeg[] = []
   for (const r of s.recs) {
     if (r.segA) raw.push(r.segA)
     if (r.segB) raw.push(r.segB)
   }
   const b = s.board
+  const kerf = s.kerf
+  const trim = s.trim
   const steps = buildSteps(b.wMm, b.hMm, kerf, trim, s.index, raw)
   const boardArea = b.wMm * b.hMm
   const usedArea = s.placements.reduce((a, p) => a + p.origLen * p.origWid, 0)
@@ -458,7 +468,9 @@ function buildSheet(s: SheetState, kerf: number, trim: number): SheetResult {
     usedAreaMm2: usedArea,
     boardAreaMm2: boardArea,
     utilization: usedArea / boardArea,
-    offcuts
+    offcuts,
+    kerfMm: kerf,
+    trimMm: trim
   }
   const sim = simulate(b.wMm, b.hMm, kerf, steps, s.placements)
   if (!sim.ok) {
@@ -470,18 +482,15 @@ function buildSheet(s: SheetState, kerf: number, trim: number): SheetResult {
 /**
  * 「随手排」基线：保持清单原顺序、固定朝向（不旋转）、朴素顺板货架式摆放。
  * 用于展示「本方案比随手排省几张板」。库存耗尽时退化为与优化方案相同的张数。
+ * 每种板按自己的生效锯路/修边扣余隙。
  */
-function shelfBaseline(
-  job: Job,
-  boards: Board[],
-  kerf: number,
-  trim: number,
-  optimizedCount: number
-): number {
+function shelfBaseline(job: Job, boards: Board[], optimizedCount: number): number {
   let count = 0
   // 用对象持有当前板状态，避免闭包对局部变量的窄化问题
   const cur: { value: { b: Board; x: number; y: number; shelfH: number } | null } = { value: null }
-  const usable = (b: Board): [number, number] => [b.wMm - 2 * trim, b.hMm - 2 * trim]
+  const trimOf = (b: Board): number => boardTrim(b, job)
+  const kerfOf = (b: Board): number => boardKerf(b, job)
+  const usable = (b: Board): [number, number] => [b.wMm - 2 * trimOf(b), b.hMm - 2 * trimOf(b)]
   const newSheet = (b: Board): void => {
     count++
     cur.value = { b, x: 0, y: 0, shelfH: 0 }
@@ -495,6 +504,7 @@ function shelfBaseline(
       const tryCur = (): boolean => {
         const c = cur.value
         if (!c || !boardMatches(c.b, part)) return false
+        const kerf = kerfOf(c.b)
         const [uw, uh] = usable(c.b)
         if (c.x + pw <= uw + EPS && c.y + Math.max(c.shelfH, ph) <= uh + EPS) {
           if (c.x === 0 && c.shelfH === 0) c.shelfH = ph
@@ -523,13 +533,13 @@ function shelfBaseline(
             (b) =>
               canOpen(b) &&
               boardMatches(b, part) &&
-              b.wMm - 2 * trim + EPS >= pw &&
-              b.hMm - 2 * trim + EPS >= ph
+              b.wMm - 2 * trimOf(b) + EPS >= pw &&
+              b.hMm - 2 * trimOf(b) + EPS >= ph
           )
           .sort((a, b) => a.wMm * a.hMm - b.wMm * b.hMm)
         if (candidates.length === 0) return Math.max(optimizedCount, count)
         newSheet(candidates[0])
-        cur.value!.x = pw + kerf
+        cur.value!.x = pw + kerfOf(candidates[0])
         cur.value!.shelfH = ph
       }
     }

@@ -5,6 +5,7 @@ import type { Board, Job, Part } from '../types'
 import { nestJob } from './packing'
 import { simulate, countSawOps } from './cuts'
 import { guillotineViolation, type Rect } from './geometry'
+import { boardKerf, boardTrim, round1, sheetKerf, sheetTrim } from './params'
 
 export interface CheckResult {
   name: string
@@ -78,11 +79,11 @@ function makeJob(parts: Part[], over: Partial<Job> = {}): Job {
   }
 }
 
-/** 检查同板任意两件之间的净距：只要相邻就必须 ≥ kerf；四周 ≥ trim。 */
+/** 检查同板任意两件之间的净距：只要相邻就必须 ≥ 该板锯路；四周 ≥ 该板修边。 */
 function assertClearances(job: Job): string | null {
-  const kerf = job.kerfMm
-  const trim = job.trimMm
   for (const sheet of job.result!.sheets) {
+    const kerf = sheetKerf(sheet, job)
+    const trim = sheetTrim(sheet, job)
     const ps = sheet.placements
     for (const p of ps) {
       if (p.x < trim - 0.06 || p.y < trim - 0.06) return '零件越过修边区（左下）'
@@ -151,6 +152,8 @@ function dumpJob(job: Job, err?: string): void {
 function assertSheet(job: Job): string | null {
   const r = job.result!
   for (const sheet of r.sheets) {
+    const kerf = sheetKerf(sheet, job)
+    const trim = sheetTrim(sheet, job)
     // guillotine 合法性
     const rects = sheet.placements.map((p) => ({
       id: p.instanceId,
@@ -160,15 +163,15 @@ function assertSheet(job: Job): string | null {
       h: p.widMm
     }))
     const bounds: Rect = {
-      x: job.trimMm,
-      y: job.trimMm,
-      w: sheet.wMm - 2 * job.trimMm,
-      h: sheet.hMm - 2 * job.trimMm
+      x: trim,
+      y: trim,
+      w: sheet.wMm - 2 * trim,
+      h: sheet.hMm - 2 * trim
     }
-    const v = guillotineViolation(rects, bounds, job.kerfMm)
+    const v = guillotineViolation(rects, bounds, kerf)
     if (v) return `板${sheet.index + 1}：${v}`
     // 逐步切割模拟
-    const sim = simulate(sheet.wMm, sheet.hMm, job.kerfMm, sheet.steps, sheet.placements)
+    const sim = simulate(sheet.wMm, sheet.hMm, kerf, sheet.steps, sheet.placements)
     if (!sim.ok) return `板${sheet.index + 1}：${sim.errors.join('；')}`
     // 利用率复算（分子不含锯路）
     const net = sheet.placements.reduce((a, p) => a + p.origLen * p.origWid, 0)
@@ -438,6 +441,113 @@ export function runSelfTest(): SelfTestReport {
       '多板种混排且 18mm 库存仅 1 张时超开并提示补采',
       ok,
       `18mm 用 ${thickSheets} 张（库存 1，需补采）、9mm 用 ${thinSheets} 张`
+    )
+  }
+
+  // 10) 板级锯路/修边覆盖：薄板按自己的参数扣余隙、修边刀位置跟随本板
+  {
+    const thick = makeBoard({ id: 'thick2', name: '主板18' }) // 跟随整单 3.2 / 8
+    const thin = makeBoard({
+      id: 'thin2',
+      name: '背板9',
+      thicknessMm: 9,
+      kerfMm: 2.0,
+      trimMm: 4.0
+    })
+    const parts = [
+      makePart({ code: 'A', lenMm: 600, widMm: 400, qty: 2, boardId: 'thick2' }),
+      makePart({ code: 'B', lenMm: 600, widMm: 400, qty: 2, boardId: 'thin2' })
+    ]
+    const job = makeJob(parts, { boards: [thick, thin], kerfMm: 3.2, trimMm: 8 })
+    const r = nestJob(job)
+    job.result = r
+    const thinSheet = r.sheets.find((s) => s.boardId === 'thin2')
+    const thickSheet = r.sheets.find((s) => s.boardId === 'thick2')
+    const errs: string[] = []
+    if (!thinSheet || !thickSheet) {
+      errs.push('薄板/厚板未分别成张')
+    } else {
+      // 快照字段 = 各板生效值
+      if (thinSheet.kerfMm !== 2.0 || thinSheet.trimMm !== 4.0) errs.push('薄板快照参数错误')
+      if (thickSheet.kerfMm !== 3.2 || thickSheet.trimMm !== 8) errs.push('厚板快照参数错误')
+      // 修边刀位置 = 修边 - 锯路/2：薄板 4-1=3.0，厚板 8-1.6=6.4
+      const thinTrimAt = thinSheet.steps.find((s) => s.kind === 'trim')?.at ?? -1
+      const thickTrimAt = thickSheet.steps.find((s) => s.kind === 'trim')?.at ?? -1
+      if (Math.abs(thinTrimAt - 3.0) > 0.06) errs.push(`薄板修边刀位置 ${thinTrimAt} ≠ 3.0`)
+      if (Math.abs(thickTrimAt - 6.4) > 0.06) errs.push(`厚板修边刀位置 ${thickTrimAt} ≠ 6.4`)
+      // 薄板零件净距 = 自己的锯路 2.0（两件相邻方向的净距）
+      const ps = thinSheet.placements
+      if (ps.length === 2) {
+        const [a, b] = ps
+        const ox = Math.min(a.x + a.lenMm, b.x + b.lenMm) - Math.max(a.x, b.x)
+        const gap =
+          ox > 0.06
+            ? Math.max(a.y, b.y) - Math.min(a.y + a.widMm, b.y + b.widMm)
+            : Math.max(a.x, b.x) - Math.min(a.x + a.lenMm, b.x + b.lenMm)
+        if (Math.abs(gap - 2.0) > 0.06) errs.push(`薄板零件净距 ${gap.toFixed(2)} ≠ 2.0`)
+      } else {
+        errs.push('薄板零件数异常')
+      }
+      // 薄板零件不越过自己的修边区（≥4.0），且按各自参数模拟可还原
+      if (thinSheet.placements.some((p) => p.x < 4 - 0.06 || p.y < 4 - 0.06))
+        errs.push('薄板零件越过 4mm 修边区')
+      if (!simulate(thinSheet.wMm, thinSheet.hMm, 2.0, thinSheet.steps, thinSheet.placements).ok)
+        errs.push('薄板按 2.0 锯路模拟失败')
+      if (!simulate(thickSheet.wMm, thickSheet.hMm, 3.2, thickSheet.steps, thickSheet.placements).ok)
+        errs.push('厚板按 3.2 锯路模拟失败')
+      // 不同板种的零件不混在同一張板
+      const codes = new Set(thinSheet.placements.map((p) => p.code))
+      if (codes.has('A')) errs.push('厚板零件混入了薄板')
+    }
+    const ok = errs.length === 0
+    add(
+      '板级锯路/修边覆盖：各板按自己的参数扣余隙、修边刀跟随本板',
+      ok,
+      ok ? '薄板 2.0/4.0、厚板跟随整单 3.2/8.0，刀路与净距均按各自参数' : errs.join('；')
+    )
+  }
+
+  // 11) 跟随语义：改整单值只带动未覆盖的板；老项目缺字段兼容；数值 1 位小数
+  {
+    const errs: string[] = []
+    const follow = makeBoard({ id: 'fw', name: '跟随板' })
+    const own = makeBoard({ id: 'own', name: '自设板', kerfMm: 2.0, trimMm: 4.0 })
+    const job = makeJob([makePart({ code: 'Z', lenMm: 400, widMm: 300 })], {
+      boards: [follow, own],
+      kerfMm: 3.2,
+      trimMm: 8
+    })
+    if (boardKerf(follow, job) !== 3.2 || boardTrim(follow, job) !== 8) errs.push('初始跟随失败')
+    if (boardKerf(own, job) !== 2.0 || boardTrim(own, job) !== 4.0) errs.push('板级覆盖未生效')
+    // 改整单值：只带动跟随的板
+    job.kerfMm = 4.0
+    job.trimMm = 6.0
+    if (boardKerf(follow, job) !== 4.0 || boardTrim(follow, job) !== 6.0)
+      errs.push('整单改值后跟随板未联动')
+    if (boardKerf(own, job) !== 2.0 || boardTrim(own, job) !== 4.0)
+      errs.push('整单改值影响了自设板')
+    // 老项目：没有板级字段、结果没有快照字段，照常打开并按整单值算
+    const legacy = JSON.parse(JSON.stringify(job)) as Job
+    delete legacy.result
+    const legacyFollow = legacy.boards.find((b) => b.id === 'fw')
+    if (!legacyFollow || 'kerfMm' in legacyFollow || 'trimMm' in legacyFollow)
+      errs.push('未覆盖的板不应带板级字段（老数据形态）')
+    const lr = nestJob(legacy)
+    if (lr.sheets.length === 0) errs.push('老项目排样失败')
+    const legacySheet = lr.sheets[0]
+    const stripped = { ...legacySheet }
+    delete stripped.kerfMm
+    delete stripped.trimMm
+    if (sheetKerf(stripped, legacy) !== legacy.kerfMm || sheetTrim(stripped, legacy) !== legacy.trimMm)
+      errs.push('缺快照字段时未回落整单值')
+    // 数值统一 1 位小数
+    if (round1(3.24) !== 3.2 || round1(3.25) !== 3.3 || round1(8) !== 8 || round1(2.5) !== 2.5)
+      errs.push('round1 保留 1 位小数不正确')
+    const ok = errs.length === 0
+    add(
+      '整单改值只带动跟随板；老项目缺字段兼容；参数保留 1 位小数',
+      ok,
+      ok ? '跟随/覆盖/回落/精度均符合预期' : errs.join('；')
     )
   }
 

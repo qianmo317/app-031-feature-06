@@ -1,6 +1,7 @@
 // 裁切步骤：修边刀、内部贯通刀的合并/排序，以及最关键的「按步骤模拟切割」验证
 import type { CutStep, Placement, SheetResult } from '../types'
 import { orderSegs, type Rect, type RawSeg, EPS, type PlacedRect } from './geometry'
+import { mm1 } from './format'
 
 export interface DSeg extends RawSeg {
   deps: DSeg[]
@@ -76,8 +77,8 @@ function buildInternalSteps(raw: DSeg[], kerf: number, boardIndex: number, start
       kind: 'cut',
       label:
         g.axis === 'v'
-          ? `沿 X = ${Math.round(g.at)}mm 竖切，贯通 ${Math.round(g.hi - g.lo)}mm`
-          : `沿 Y = ${Math.round(g.at)}mm 横切，贯通 ${Math.round(g.hi - g.lo)}mm`
+          ? `沿 X = ${mm1(g.at)}mm 竖切，贯通 ${mm1(g.hi - g.lo)}mm`
+          : `沿 Y = ${mm1(g.at)}mm 横切，贯通 ${mm1(g.hi - g.lo)}mm`
     }
   })
 }
@@ -98,7 +99,7 @@ export function trimSteps(w: number, h: number, kerf: number, trim: number, boar
     span,
     order,
     kind: 'trim',
-    label: `修边刀：${edge}修掉 ${trim}mm`
+    label: `修边刀：${edge}修掉 ${mm1(trim)}mm`
   })
   return [
     mk('h', trim - kerf / 2, [0, w], 0, '底边'),
@@ -265,8 +266,8 @@ function stepsFromSegs(
       kind: 'cut' as const,
       label:
         s.axis === 'v'
-          ? `沿 X = ${Math.round(s.at)}mm 竖切，贯通 ${Math.round(s.hi - s.lo)}mm`
-          : `沿 Y = ${Math.round(s.at)}mm 横切，贯通 ${Math.round(s.hi - s.lo)}mm`
+          ? `沿 X = ${mm1(s.at)}mm 竖切，贯通 ${mm1(s.hi - s.lo)}mm`
+          : `沿 Y = ${mm1(s.at)}mm 横切，贯通 ${mm1(s.hi - s.lo)}mm`
     }))
   ]
 }
